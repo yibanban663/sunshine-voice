@@ -2297,7 +2297,7 @@ namespace stream {
           util::endian::big<std::uint32_t>(session->voice.avRiKeyId + seq);
 
         cipher_len = session->voice.cipher.encrypt(
-          std::string_view { (const char *) plain.data(), (std::size_t) opus_len },
+          std::string_view((const char *) plain.data(), (std::size_t) opus_len),
           payload.data() + 1,
           &iv);
         if (cipher_len < 0) continue;

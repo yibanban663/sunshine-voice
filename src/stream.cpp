@@ -1638,7 +1638,7 @@ namespace stream {
       // D = 255 / (1 + F)
       // multiplied by 100 since F is the percentage as an integer:
       // D = (255 * 100) / (100 + F)
-      auto max_data_shards_per_fec_block = (DATA_SHARDS_MAX * 100) / (100 + fecPercentage);
+      auto max_data_shards_per_fec_block = (RS8_DATA_SHARDS_MAX * 100) / (100 + fecPercentage);
 
       // Compute the number of FEC blocks needed for this frame using the block size and max shards
       auto max_data_per_fec_block = max_data_shards_per_fec_block * blocksize;
@@ -2035,28 +2035,11 @@ namespace stream {
       return -1;
     }
 
-    // x-ss-voice: bind voice track socket only when voice_source is configured
-    if (!config::audio.voice_source.empty()) {
-      auto voice_port = net::map_port(VOICE_STREAM_PORT);
-      ctx.voice_sock.open(protocol, ec);
-      if (!ec) {
-        ctx.voice_sock.bind(udp::endpoint(bind_addr, voice_port), ec);
-        if (ec) {
-          BOOST_LOG(warning) << "Couldn't bind Voice port ["sv << voice_port << "]: "sv << ec.message() << "; voice track disabled"sv;
-        }
-      }
-    }
-
     ctx.message_queue_queue = std::make_shared<message_queue_queue_t::element_type>(30);
 
     ctx.video_thread = std::jthread {videoBroadcastThread, std::ref(ctx.video_sock)};
     ctx.audio_thread = std::jthread {audioBroadcastThread, std::ref(ctx.audio_sock)};
     ctx.control_thread = std::jthread {controlBroadcastThread, &ctx.control_server};
-
-    // x-ss-voice: launch voice thread only if configured and socket bound
-    if (!config::audio.voice_source.empty() && ctx.voice_sock.is_open()) {
-      ctx.voice_thread = std::jthread { voice::voiceThread, /* session filled later */ nullptr, std::ref(ctx.voice_sock) };
-    }
 
     ctx.recv_thread = std::jthread {recvThread, std::ref(ctx)};
 
@@ -2414,11 +2397,23 @@ namespace stream {
       session->audio.sequenceNumber = 0;
       session->audio.timestamp = 0;
 
-      // x-ss-voice: initialize voice track state (same session key material as audio)
-      session->voice.cipher = session->audio.cipher;
+      // x-ss-voice: initialize voice track state with the same session key
+      // material as audio. cbc_t is not copyable, so construct a fresh
+      // cipher with the shared session key.
+      session->voice.cipher = crypto::cipher::cbc_t {
+        launch_session.gcm_key,
+        true
+      };
       session->voice.avRiKeyId = session->audio.avRiKeyId;
       session->voice.sequenceNumber = 0;
       session->voice.timestamp = 0;
+
+      // x-ss-voice: the voice thread binds its own UDP socket and waits for
+      // the client's first ping, so it is safe to start it as soon as the
+      // session exists. It exits on the session shutdown event.
+      if (!config::audio.voice_source.empty()) {
+        std::thread { voice::voiceThread, session.get() }.detach();
+      }
 
       session->control.peer = nullptr;
       session->state.store(state_e::STOPPED, std::memory_order_relaxed);

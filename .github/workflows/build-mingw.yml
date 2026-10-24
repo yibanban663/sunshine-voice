@@ -4,6 +4,7 @@ on: [push, workflow_dispatch]
 
 env:
   VCPKG_DEFAULT_TRIPLET: x64-mingw-dynamic
+  VCPKG_COMMIT: 0c2a9ace1964b818b15f7ae50ba1c42404918a7b
 
 jobs:
   build:
@@ -18,18 +19,31 @@ jobs:
       - name: Install MinGW-w64 + tools
         shell: pwsh
         run: |
-          choco install -y mingw cmake nasm
-          # Add to PATH for subsequent steps
+          choco install -y mingw nasm
+          # CMake >= 4.4 breaks vcpkg's find_package wrapper (infinite
+          # include/_find_package recursion) -> use official 3.31.6 zip instead
+          $cmakeZip = "$env:RUNNER_TEMP\cmake-3.31.6-windows-x86_64.zip"
+          Invoke-WebRequest -Uri "https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-windows-x86_64.zip" -OutFile $cmakeZip
+          Expand-Archive $cmakeZip -DestinationPath $env:RUNNER_TEMP
+          "$env:RUNNER_TEMP\cmake-3.31.6-windows-x86_64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           "C:\ProgramData\mingw\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$env:RUNNER_TEMP\cmake-3.31.6-windows-x86_64\bin\cmake.exe" --version
           gcc --version
-          cmake --version
 
       - name: Setup vcpkg manually
         shell: pwsh
         run: |
           git clone --depth 1 https://github.com/microsoft/vcpkg.git ${{ runner.workspace }}/vcpkg
+          git -C ${{ runner.workspace }}/vcpkg fetch --depth 1 origin $env:VCPKG_COMMIT
+          git -C ${{ runner.workspace }}/vcpkg checkout $env:VCPKG_COMMIT
           & ${{ runner.workspace }}/vcpkg/bootstrap-vcpkg.bat -disableMetrics
           echo "VCPKG_ROOT=${{ runner.workspace }}/vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Restore vcpkg installed tree
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.workspace }}/vcpkg/installed
+          key: vcpkg-installed-x64-mingw-dynamic-${{ env.VCPKG_COMMIT }}
 
       - name: Install packages
         shell: pwsh
@@ -40,7 +54,7 @@ jobs:
       - name: Configure + Build
         shell: cmd
         run: |
-          set PATH=C:\ProgramData\mingw\mingw64\bin;C:\Program Files\CMake\bin;C:\Program Files\NASM;%PATH%
+          set PATH=%RUNNER_TEMP%\cmake-3.31.6-windows-x86_64\bin;C:\ProgramData\mingw\mingw64\bin;C:\Program Files\NASM;%PATH%
           set CC=gcc
           set CXX=g++
 

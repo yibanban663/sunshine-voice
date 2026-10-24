@@ -36,7 +36,14 @@ namespace voice {
 
       IMMDevice *dev = nullptr;
       if (!device_name.empty()) {
-        // Match the capture endpoint by friendly name (case-insensitive substring)
+        // Match the capture endpoint by friendly name (case-insensitive substring).
+        // The configured name is UTF-8; convert properly to wide chars.
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, device_name.c_str(), -1, nullptr, 0);
+        std::wstring want(static_cast<size_t>(wlen > 0 ? wlen - 1 : 0), L'\0');
+        if (wlen > 1) {
+          MultiByteToWideChar(CP_UTF8, 0, device_name.c_str(), -1, want.data(), wlen);
+        }
+
         IMMDeviceCollection *coll = nullptr;
         enum_->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &coll);
         UINT n = 0;
@@ -51,14 +58,18 @@ namespace voice {
           std::wstring name(pv.pwszVal ? pv.pwszVal : L"");
           PropVariantClear(&pv);
           ps->Release();
-          std::wstring want(device_name.begin(), device_name.end());
           std::transform(name.begin(), name.end(), name.begin(), ::towlower);
-          std::transform(want.begin(), want.end(), want.begin(), ::towlower);
-          if (name.find(want) != std::wstring::npos) break;
+          std::wstring wantLower(want);
+          std::transform(wantLower.begin(), wantLower.end(), wantLower.begin(), ::towlower);
+          if (!wantLower.empty() && name.find(wantLower) != std::wstring::npos) break;
           dev->Release();
           dev = nullptr;
         }
         coll->Release();
+      }
+      if (!dev) {
+        // No match (or no name configured): fall back to the default capture device
+        enum_->GetDefaultAudioEndpoint(eCapture, eCommunications, &dev);
       }
       if (!dev) enum_->GetDefaultAudioEndpoint(eCapture, eConsole, &dev);
       if (!dev) return false;

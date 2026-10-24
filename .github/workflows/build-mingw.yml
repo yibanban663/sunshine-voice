@@ -1,0 +1,67 @@
+name: Build Windows (MinGW)
+permissions: {}
+on: [push, workflow_dispatch]
+
+env:
+  VCPKG_DEFAULT_TRIPLET: x64-mingw-dynamic
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install MinGW-w64 + tools
+        shell: pwsh
+        run: |
+          choco install -y mingw cmake nasm
+          # Add to PATH for subsequent steps
+          "C:\ProgramData\mingw\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          gcc --version
+          cmake --version
+
+      - name: Setup vcpkg manually
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git ${{ runner.workspace }}/vcpkg
+          & ${{ runner.workspace }}/vcpkg/bootstrap-vcpkg.bat -disableMetrics
+          echo "VCPKG_ROOT=${{ runner.workspace }}/vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install packages
+        shell: pwsh
+        run: |
+          $vcpkg = "${{ runner.workspace }}/vcpkg/vcpkg.exe"
+          & $vcpkg install boost-asio:x64-mingw-dynamic boost-filesystem:x64-mingw-dynamic boost-interprocess:x64-mingw-dynamic boost-json:x64-mingw-dynamic boost-log:x64-mingw-dynamic boost-program-options:x64-mingw-dynamic boost-property-tree:x64-mingw-dynamic boost-random:x64-mingw-dynamic boost-regex:x64-mingw-dynamic boost-thread:x64-mingw-dynamic boost-uuid:x64-mingw-dynamic openssl:x64-mingw-dynamic opus:x64-mingw-dynamic
+
+      - name: Configure + Build
+        shell: cmd
+        run: |
+          set PATH=C:\ProgramData\mingw\mingw64\bin;C:\Program Files\CMake\bin;C:\Program Files\NASM;%PATH%
+          set CC=gcc
+          set CXX=g++
+
+          cd /d %GITHUB_WORKSPACE%
+          mkdir build && cd build
+          cmake .. -G "MinGW Makefiles" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_C_COMPILER=gcc ^
+            -DCMAKE_CXX_COMPILER=g++ ^
+            -DCMAKE_TOOLCHAIN_FILE=%RUNNER_WORKSPACE%\vcpkg\scripts\buildsystems\vcpkg.cmake ^
+            -DVCPKG_TARGET_TRIPLET=x64-mingw-dynamic ^
+            -DSUNSHINE_USE_STATIC_QT=OFF ^
+            -DBUILD_TESTS=OFF -DBUILD_TESTING=OFF
+
+          cmake --build . --target sunshine -j%NUMBER_OF_PROCESSORS%
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sunshine-mingw-x64
+          path: |
+            build/sunshine.exe
+            build/*.dll
+          if-no-files-found: warn

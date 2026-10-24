@@ -84,6 +84,8 @@ jobs:
             -G Ninja \
             -S . \
             -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_TESTING=OFF \
             -DSUNSHINE_ASSETS_DIR=assets
           ninja -C build
 

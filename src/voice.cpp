@@ -1,61 +1,46 @@
 /**
  * @file src/voice.cpp
- * @brief x-ss-voice: host voice track capture and streaming.
- *
- * Captures the host microphone (WASAPI shared mode) → Opus 48kHz mono →
- * independent RTP stream on VOICE_STREAM_PORT.  Fully parallel to the game
- * audio track — no shared state beyond the session encryption key.
+ * @brief x-ss-voice: host microphone capture (WASAPI shared mode).
  */
-#include <thread>
-#include <chrono>
-#include <array>
-#include <vector>
-#include <algorithm>
-#include <memory>
-#include <cstring>
-
-#include <boost/asio.hpp>
-
-#include <opus/opus.h>
-
 #include "voice.h"
-#include "stream.h"
-#include "config.h"
-#include "crypto.h"
-#include "network.h"
-#include "utility.h"
-#include "platform/common.h"
 
-#include <moonlight-common-c/src/Limelight-internal.h>  // SS_ENC_AUDIO
+#include <algorithm>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <functiondiscoverykeys_devpkey.h>
-#define VOICE_WASAPI 1
 #endif
 
 namespace voice {
-  using namespace stream;
 
-#ifdef VOICE_WASAPI
+#ifdef _WIN32
 
-  class wasapi_capture_t {
-  public:
-    static std::unique_ptr<wasapi_capture_t>
-    open(const std::string &device_name) {
+  struct capturer::impl_t {
+    IMMDeviceEnumerator *enum_ {};
+    IAudioClient *client_ {};
+    IAudioCaptureClient *cap_ {};
+    std::vector<std::int16_t> pending;
+
+    bool open(const std::string &device_name) {
       HRESULT hr;
-      auto c = std::unique_ptr<wasapi_capture_t>(new wasapi_capture_t());
+
+      // WASAPI requires COM on the calling thread
+      CoInitializeEx(nullptr, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
+
       hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                            __uuidof(IMMDeviceEnumerator), (void **) &c->enum_);
-      if (FAILED(hr)) return nullptr;
+                            __uuidof(IMMDeviceEnumerator), (void **) &enum_);
+      if (FAILED(hr)) return false;
 
       IMMDevice *dev = nullptr;
       if (!device_name.empty()) {
+        // Match the capture endpoint by friendly name (case-insensitive substring)
         IMMDeviceCollection *coll = nullptr;
-        c->enum_->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &coll);
-        UINT n = 0; coll->GetCount(&n);
+        enum_->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &coll);
+        UINT n = 0;
+        coll->GetCount(&n);
         for (UINT i = 0; i < n; ++i) {
           coll->Item(i, &dev);
           IPropertyStore *ps;
@@ -67,200 +52,105 @@ namespace voice {
           PropVariantClear(&pv);
           ps->Release();
           std::wstring want(device_name.begin(), device_name.end());
-          // Case-insensitive substring match
           std::transform(name.begin(), name.end(), name.begin(), ::towlower);
           std::transform(want.begin(), want.end(), want.begin(), ::towlower);
           if (name.find(want) != std::wstring::npos) break;
-          dev->Release(); dev = nullptr;
+          dev->Release();
+          dev = nullptr;
         }
         coll->Release();
       }
-      if (!dev) c->enum_->GetDefaultAudioEndpoint(eCapture, eConsole, &dev);
-      if (!dev) return nullptr;
+      if (!dev) enum_->GetDefaultAudioEndpoint(eCapture, eConsole, &dev);
+      if (!dev) return false;
 
-      hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void **) &c->client_);
+      hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void **) &client_);
       dev->Release();
-      if (FAILED(hr)) return nullptr;
+      if (FAILED(hr)) return false;
 
+      // Voice: 48 kHz mono 16-bit, 100 ms buffer
       WAVEFORMATEX wfx {};
       wfx.wFormatTag = WAVE_FORMAT_PCM;
       wfx.nChannels = 1;
-      wfx.nSamplesPerSec = 48000;
+      wfx.nSamplesPerSec = SAMPLE_RATE;
       wfx.wBitsPerSample = 16;
       wfx.nBlockAlign = 2;
-      wfx.nAvgBytesPerSec = 96000;
-      hr = c->client_->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 1000000, 0, &wfx, nullptr);
-      if (FAILED(hr)) return nullptr;
-      hr = c->client_->GetService(__uuidof(IAudioCaptureClient), (void **) &c->cap_);
-      if (FAILED(hr)) return nullptr;
-      c->client_->Start();
-      return c;
+      wfx.nAvgBytesPerSec = SAMPLE_RATE * 2;
+      hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 1000000 /*100ms*/, 0, &wfx, nullptr);
+      if (FAILED(hr)) return false;
+      hr = client_->GetService(__uuidof(IAudioCaptureClient), (void **) &cap_);
+      if (FAILED(hr)) return false;
+      client_->Start();
+      return true;
     }
 
-    bool read_frame(std::array<std::int16_t, 480> &out) {
-      static thread_local std::vector<std::int16_t> pending;
-      while (pending.size() < 480) {
+    bool read_frame(std::array<std::int16_t, FRAME_SAMPLES> &out) {
+      while (pending.size() < FRAME_SAMPLES) {
         UINT32 n = 0;
         HRESULT hr = cap_->GetNextPacketSize(&n);
         if (FAILED(hr) || n == 0) {
+          // Not enough captured yet: pad with silence to keep the timeline
           std::fill(out.begin(), out.end(), 0);
           return true;
         }
-        BYTE *data; UINT32 samples; DWORD flags;
+        BYTE *data;
+        UINT32 samples;
+        DWORD flags;
         hr = cap_->GetBuffer(&data, &samples, &flags, nullptr, nullptr);
         if (FAILED(hr)) return false;
         auto *s = (std::int16_t *) data;
         if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
           pending.resize(pending.size() + samples);
-        } else {
+        }
+        else {
           pending.insert(pending.end(), s, s + samples);
         }
         cap_->ReleaseBuffer(samples);
       }
-      std::copy_n(pending.begin(), 480, out.begin());
-      pending.erase(pending.begin(), pending.begin() + 480);
+      std::copy_n(pending.begin(), FRAME_SAMPLES, out.begin());
+      pending.erase(pending.begin(), pending.begin() + FRAME_SAMPLES);
       return true;
     }
 
-    ~wasapi_capture_t() {
+    ~impl_t() {
       if (client_) client_->Stop();
     }
-
-  private:
-    IMMDeviceEnumerator *enum_ {};
-    IAudioClient *client_ {};
-    IAudioCaptureClient *cap_ {};
-  };
-#endif // VOICE_WASAPI
-
-  struct rtp_header_t {
-    std::uint8_t header = 0x80;
-    std::uint8_t packetType = 97;
-    std::uint16_t sequenceNumber;
-    std::uint32_t timestamp;
-    std::uint32_t ssrc = 0;
   };
 
-  void
-  voiceThread(session_t *session) {
-    platf::set_thread_name("stream::voice");
+  capturer::capturer() :
+      impl(std::make_unique<impl_t>()) {}
+  capturer::~capturer() = default;
 
-#ifdef VOICE_WASAPI
-    // WASAPI capture requires COM on this thread
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
-
-    // 1) Open the voice socket (the voice track runs its own I/O context)
-    boost::asio::io_context io_context;
-    udp::socket sock(io_context);
-    boost::system::error_code ec;
-    sock.open(udp::v4(), ec);
-    if (ec) return;
-
-    auto bind_addr = boost::asio::ip::make_address(net::get_bind_address(net::IPV4), ec);
-    sock.bind(udp::endpoint(bind_addr, net::map_port(VOICE_STREAM_PORT)), ec);
-    if (ec) {
-      BOOST_LOG(warning) << "x-ss-voice: couldn't bind port "sv << net::map_port(VOICE_STREAM_PORT);
-      return;
+  std::unique_ptr<capturer>
+  capturer::open(const std::string &device_name) {
+    auto cap = std::unique_ptr<capturer>(new capturer());
+    if (!cap->impl->open(device_name)) {
+      return nullptr;
     }
-
-    // 2) Wait for the client ping to learn the peer endpoint. The receive
-    // polls with a timeout so the thread can observe the session shutdown
-    // event and release the UDP port even if no voice-capable client ever
-    // pings (otherwise the port would stay bound for the process lifetime).
-    std::array<char, 256> ping_buf;
-    udp::endpoint peer;
-    for (;;) {
-      if (session->shutdown_event->peek()) return;
-
-      DWORD recv_timeout_ms = 500;
-      setsockopt(sock.native_handle(), SOL_SOCKET, SO_RCVTIMEO,
-                 (const char *) &recv_timeout_ms, sizeof(recv_timeout_ms));
-
-      auto n = sock.receive_from(boost::asio::buffer(ping_buf), peer, 0, ec);
-      if (ec == boost::asio::error::would_block || ec.value() == WSAETIMEDOUT) continue;
-      if (ec) return;
-      if (n > 0) break;
-    }
-    session->voice.peer = peer;
-    BOOST_LOG(info) << "x-ss-voice: peer "sv << peer.address().to_string() << ":"sv << peer.port();
-
-    // 3) Open the microphone
-    auto cap = wasapi_capture_t::open(config::audio.voice_source);
-    if (!cap) {
-      BOOST_LOG(warning) << "x-ss-voice: couldn't open voice_source '"sv << config::audio.voice_source << "'"sv;
-      return;
-    }
-
-    // 4) Create Opus encoder (VOIP mode, mono, 48kHz)
-    int err = 0;
-    std::unique_ptr<OpusEncoder, decltype(&opus_encoder_destroy)>
-      enc(opus_encoder_create(48000, 1, OPUS_APPLICATION_VOIP, &err), &opus_encoder_destroy);
-    if (err != OPUS_OK) return;
-
-    BOOST_LOG(info) << "x-ss-voice: voice track started"sv;
-
-    // 5) Capture → encode → RTP → send
-    std::array<std::int16_t, 480> frame {};
-    std::array<std::uint8_t, 4000> payload {};
-    std::array<std::uint8_t, 1275> plain {};
-    const bool voice_encrypted = session->config.encryptionFlagsEnabled & SS_ENC_AUDIO;
-
-    while (!session->shutdown_event->peek()) {
-      if (!cap->read_frame(frame)) break;
-
-      auto opus_len = opus_encode(enc.get(), frame.data(), 480,
-                                   plain.data(), (opus_int32) plain.size());
-      if (opus_len < 0) continue;
-
-      auto seq = session->voice.sequenceNumber;
-
-      // Encrypt (Moonlight audio format: 1-byte length prefix + AES-CBC
-      // ciphertext with the IV derived from avRiKeyId + seq, big endian)
-      std::uint8_t header[1] = { (std::uint8_t) opus_len };
-      std::memcpy(payload.data(), header, 1);
-
-      int cipher_len;
-      if (voice_encrypted) {
-        crypto::aes_t iv(16, 0);
-        *(std::uint32_t *) iv.data() =
-          util::endian::big<std::uint32_t>(session->voice.avRiKeyId + seq);
-
-        cipher_len = session->voice.cipher.encrypt(
-          std::string_view { (const char *) plain.data(), (std::size_t) opus_len },
-          payload.data() + 1,
-          &iv);
-        if (cipher_len < 0) continue;
-      }
-      else {
-        std::memcpy(payload.data() + 1, plain.data(), opus_len);
-        cipher_len = opus_len;
-      }
-
-      auto send_len = cipher_len + 1;
-
-      rtp_header_t rtp;
-      rtp.sequenceNumber = util::endian::big(seq);
-      rtp.timestamp = util::endian::big(session->voice.timestamp);
-
-      // Send: RTP header + payload in one datagram
-      std::array<std::uint8_t, sizeof(rtp_header_t) + 4000> dg {};
-      std::memcpy(dg.data(), &rtp, sizeof(rtp));
-      std::memcpy(dg.data() + sizeof(rtp), payload.data(), send_len);
-
-      sock.send_to(boost::asio::buffer(dg.data(), sizeof(rtp) + send_len), peer, 0, ec);
-      if (ec) {
-        BOOST_LOG(warning) << "x-ss-voice: send error "sv << ec.message();
-        break;
-      }
-
-      session->voice.sequenceNumber++;
-      session->voice.timestamp += 10;
-
-      std::this_thread::sleep_for(std::chrono::milliseconds(9));
-    }
-
-    BOOST_LOG(info) << "x-ss-voice: voice track stopped"sv;
-#endif // _WIN32
+    return cap;
   }
 
-} // namespace voice
+  bool
+  capturer::read_frame(std::array<std::int16_t, FRAME_SAMPLES> &out) {
+    return impl->read_frame(out);
+  }
+
+#else  // !_WIN32
+
+  struct capturer::impl_t {};
+
+  capturer::capturer() {}
+  capturer::~capturer() {}
+
+  std::unique_ptr<capturer>
+  capturer::open(const std::string &) {
+    return nullptr;
+  }
+
+  bool
+  capturer::read_frame(std::array<std::int16_t, FRAME_SAMPLES> &) {
+    return false;
+  }
+
+#endif
+
+}  // namespace voice

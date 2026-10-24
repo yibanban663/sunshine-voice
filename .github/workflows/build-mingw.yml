@@ -69,7 +69,7 @@ jobs:
           MSYS2_PATH_TYPE: inherit
           UV_PYTHON: ${{ steps.setup-python.outputs.python-path }}
         run: |
-          uv sync --locked --no-python-downloads --no-install-project
+          uv sync --frozen --no-python-downloads --no-install-project
 
       - name: Build Windows
         env:

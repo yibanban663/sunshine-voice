@@ -10,6 +10,8 @@
 #include <chrono>
 #include <array>
 #include <vector>
+#include <algorithm>
+#include <memory>
 
 #include <boost/asio.hpp>
 
@@ -19,13 +21,17 @@
 #include "stream.h"
 #include "config.h"
 #include "crypto.h"
+#include "network.h"
 #include "utility.h"
 #include "platform/common.h"
+
+#include <moonlight-common-c/src/Limelight-internal.h>  // SS_ENC_AUDIO
 
 #ifdef _WIN32
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <functiondiscoverykeys_devpkey.h>
 #define VOICE_WASAPI 1
 #endif
 
@@ -139,8 +145,11 @@ namespace voice {
     platf::set_thread_name("stream::voice");
 
 #ifdef VOICE_WASAPI
-    // 1) Open the voice socket
-    auto &io_context = *session->voice_sock_ctx;
+    // WASAPI capture requires COM on this thread
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
+
+    // 1) Open the voice socket (the voice track runs its own I/O context)
+    boost::asio::io_context io_context;
     udp::socket sock(io_context);
     boost::system::error_code ec;
     sock.open(udp::v4(), ec);
@@ -180,7 +189,7 @@ namespace voice {
     std::array<std::int16_t, 480> frame {};
     std::array<std::uint8_t, 4000> payload {};
     std::array<std::uint8_t, 1275> plain {};
-    std::array<std::uint8_t, 16> iv {};
+    const bool voice_encrypted = session->config.encryptionFlagsEnabled & SS_ENC_AUDIO;
 
     while (!session->shutdown_event->peek()) {
       if (!cap->read_frame(frame)) break;
@@ -190,20 +199,30 @@ namespace voice {
       if (opus_len < 0) continue;
 
       auto seq = session->voice.sequenceNumber;
-      *(std::uint32_t *) iv.data() =
-        util::endian::big<std::uint32_t>(session->voice.avRiKeyId + seq);
 
-      // Encrypt (Moonlight audio format: 1-byte length prefix + AES-CBC ciphertext)
+      // Encrypt (Moonlight audio format: 1-byte length prefix + AES-CBC
+      // ciphertext with the IV derived from avRiKeyId + seq, big endian)
       std::uint8_t header[1] = { (std::uint8_t) opus_len };
       std::memcpy(payload.data(), header, 1);
 
-      auto cipher_len = crypto::encrypt(
-        session->voice.cipher,
-        plain.data(), opus_len,
-        payload.data() + 1,
-        iv.data());
+      int cipher_len;
+      if (voice_encrypted) {
+        crypto::aes_t iv(16, 0);
+        *(std::uint32_t *) iv.data() =
+          util::endian::big<std::uint32_t>(session->voice.avRiKeyId + seq);
 
-      auto send_len = (cipher_len > 0) ? cipher_len + 1 : opus_len + 1;
+        cipher_len = session->voice.cipher.encrypt(
+          std::string_view { (const char *) plain.data(), (std::size_t) opus_len },
+          payload.data() + 1,
+          &iv);
+        if (cipher_len < 0) continue;
+      }
+      else {
+        std::memcpy(payload.data() + 1, plain.data(), opus_len);
+        cipher_len = opus_len;
+      }
+
+      auto send_len = cipher_len + 1;
 
       rtp_header_t rtp;
       rtp.sequenceNumber = util::endian::big(seq);

@@ -15,6 +15,7 @@
 // lib includes
 #include <boost/endian/arithmetic.hpp>
 #include <openssl/err.h>
+#include <opus/opus.h>
 #include <rs.h>
 
 extern "C" {
@@ -494,8 +495,7 @@ namespace stream {
 
     udp::socket video_sock {io_context};  ///< UDP socket bound for video packet transmission.
     udp::socket audio_sock {io_context};  ///< UDP socket bound for audio packet transmission.
-    udp::socket voice_sock {io_context};  ///< x-ss-voice: UDP socket for host voice track.
-    std::jthread voice_thread;  ///< x-ss-voice: voice capture/broadcast thread.
+    udp::socket voice_sock {io_context};  ///< x-ss-voice: reserved (the voice thread binds its own socket).
 
     control_server_t control_server;  ///< ENet server for GameStream control packets.
   };
@@ -512,6 +512,7 @@ namespace stream {
 
     std::jthread audioThread;  ///< Audio thread.
     std::jthread videoThread;  ///< Video thread.
+    std::jthread voiceThread;  ///< x-ss-voice: optional microphone track thread.
 
     std::chrono::steady_clock::time_point pingTimeout;  ///< Deadline for receiving the next client ping.
 
@@ -2201,6 +2202,134 @@ namespace stream {
     audio::capture(session->mail, session->config.audio, session);
   }
 
+  /**
+   * @brief x-ss-voice: capture the host microphone and stream it to the
+   * client as an independent RTP track, mirroring the game audio format
+   * (PT 97, 1-byte clear length header + AES-CBC ciphertext) on its own
+   * UDP port negotiated via `SETUP streamid=audio/1/0`.
+   *
+   * The thread binds its own socket, learns the client endpoint from the
+   * first incoming packet (the client pings the port like it does for the
+   * audio track), and exits when the session shutdown event is raised.
+   * Any failure just ends the track; the session is unaffected.
+   */
+  static void voiceThread(session_t *session) {
+#ifdef _WIN32
+    platf::set_thread_name("session::voice");
+
+    boost::system::error_code ec;
+    boost::asio::io_context io_context;
+    udp::socket sock(io_context);
+    sock.open(udp::v4(), ec);
+    if (ec) return;
+
+    auto bind_addr = boost::asio::ip::make_address(net::get_bind_address(net::IPV4), ec);
+    sock.bind(udp::endpoint(bind_addr, net::map_port(VOICE_STREAM_PORT)), ec);
+    if (ec) {
+      BOOST_LOG(warning) << "x-ss-voice: couldn't bind port "sv << net::map_port(VOICE_STREAM_PORT) << ": "sv << ec.message();
+      return;
+    }
+
+    // Wait for the client ping to learn the peer endpoint. The receive
+    // polls with a timeout so the thread observes shutdown and releases
+    // the port even if no voice-capable client ever pings.
+    std::array<char, 256> ping_buf;
+    udp::endpoint peer;
+    for (;;) {
+      if (session->shutdown_event->peek()) return;
+
+      DWORD recv_timeout_ms = 500;
+      setsockopt(sock.native_handle(), SOL_SOCKET, SO_RCVTIMEO,
+                 (const char *) &recv_timeout_ms, sizeof(recv_timeout_ms));
+
+      auto n = sock.receive_from(boost::asio::buffer(ping_buf), peer, 0, ec);
+      if (ec == boost::asio::error::would_block || ec.value() == WSAETIMEDOUT) continue;
+      if (ec) return;
+      if (n > 0) break;
+    }
+    session->voice.peer = peer;
+    BOOST_LOG(info) << "x-ss-voice: peer "sv << peer.address().to_string() << ":"sv << peer.port();
+
+    auto cap = voice::capturer::open(config::audio.voice_source);
+    if (!cap) {
+      BOOST_LOG(warning) << "x-ss-voice: couldn't open voice_source '"sv << config::audio.voice_source << "'"sv;
+      return;
+    }
+
+    int opus_err = 0;
+    std::unique_ptr<OpusEncoder, decltype(&opus_encoder_destroy)>
+      enc(opus_encoder_create(voice::SAMPLE_RATE, 1, OPUS_APPLICATION_VOIP, &opus_err), &opus_encoder_destroy);
+    if (opus_err != OPUS_OK) return;
+
+    BOOST_LOG(info) << "x-ss-voice: voice track started"sv;
+
+    struct rtp_header_t {
+      std::uint8_t header = 0x80;
+      std::uint8_t packetType = 97;
+      std::uint16_t sequenceNumber;
+      std::uint32_t timestamp;
+      std::uint32_t ssrc = 0;
+    };
+
+    std::array<std::int16_t, voice::FRAME_SAMPLES> frame {};
+    std::array<std::uint8_t, 4000> payload {};
+    std::array<std::uint8_t, 1275> plain {};
+    std::array<std::uint8_t, sizeof(rtp_header_t) + 4000> dg {};
+    const bool voice_encrypted = session->config.encryptionFlagsEnabled & SS_ENC_AUDIO;
+
+    while (!session->shutdown_event->peek()) {
+      if (!cap->read_frame(frame)) break;
+
+      auto opus_len = opus_encode(enc.get(), frame.data(), voice::FRAME_SAMPLES,
+                                  plain.data(), (opus_int32) plain.size());
+      if (opus_len < 0) continue;
+
+      auto seq = session->voice.sequenceNumber;
+
+      // Moonlight audio wire format: 1-byte clear length header +
+      // AES-CBC ciphertext with the IV derived from avRiKeyId + seq
+      payload[0] = (std::uint8_t) opus_len;
+
+      int cipher_len;
+      if (voice_encrypted) {
+        crypto::aes_t iv(16, 0);
+        *(std::uint32_t *) iv.data() =
+          util::endian::big<std::uint32_t>(session->voice.avRiKeyId + seq);
+
+        cipher_len = session->voice.cipher.encrypt(
+          std::string_view { (const char *) plain.data(), (std::size_t) opus_len },
+          payload.data() + 1,
+          &iv);
+        if (cipher_len < 0) continue;
+      }
+      else {
+        std::memcpy(payload.data() + 1, plain.data(), opus_len);
+        cipher_len = opus_len;
+      }
+
+      rtp_header_t rtp;
+      rtp.sequenceNumber = util::endian::big(seq);
+      rtp.timestamp = util::endian::big(session->voice.timestamp);
+
+      std::memcpy(dg.data(), &rtp, sizeof(rtp));
+      std::memcpy(dg.data() + sizeof(rtp), payload.data(), cipher_len + 1);
+
+      sock.send_to(boost::asio::buffer(dg.data(), sizeof(rtp) + cipher_len + 1), peer, 0, ec);
+      if (ec) {
+        BOOST_LOG(warning) << "x-ss-voice: send error "sv << ec.message();
+        break;
+      }
+
+      session->voice.sequenceNumber++;
+      session->voice.timestamp += 10;  // 10 ms frames
+    }
+
+    BOOST_LOG(info) << "x-ss-voice: voice track stopped"sv;
+#else
+    (void) session;
+#endif
+  }
+
   namespace session {
     std::atomic_uint running_sessions;  ///< Running sessions.
 
@@ -2254,6 +2383,10 @@ namespace stream {
       session.videoThread.join();
       BOOST_LOG(debug) << "Waiting for audio to end..."sv;
       session.audioThread.join();
+      if (session.voiceThread.joinable()) {
+        BOOST_LOG(debug) << "Waiting for voice to end..."sv;
+        session.voiceThread.join();
+      }
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
       session.controlEnd.view();
       // Reset input on session stop to avoid stuck repeated keys
@@ -2314,6 +2447,13 @@ namespace stream {
 
       session.audioThread = std::jthread {audioThread, &session};
       session.videoThread = std::jthread {videoThread, &session};
+
+      // x-ss-voice: start the optional microphone track. The thread binds
+      // its own UDP socket and waits for the client ping, so it is safe to
+      // start unconditionally-ish; it exits on the session shutdown event.
+      if (!config::audio.voice_source.empty()) {
+        session.voiceThread = std::jthread {voiceThread, &session};
+      }
 
       session.state.store(state_e::RUNNING, std::memory_order_relaxed);
 
@@ -2407,13 +2547,6 @@ namespace stream {
       session->voice.avRiKeyId = session->audio.avRiKeyId;
       session->voice.sequenceNumber = 0;
       session->voice.timestamp = 0;
-
-      // x-ss-voice: the voice thread binds its own UDP socket and waits for
-      // the client's first ping, so it is safe to start it as soon as the
-      // session exists. It exits on the session shutdown event.
-      if (!config::audio.voice_source.empty()) {
-        std::thread { voice::voiceThread, session.get() }.detach();
-      }
 
       session->control.peer = nullptr;
       session->state.store(state_e::STOPPED, std::memory_order_relaxed);

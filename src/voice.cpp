@@ -12,6 +12,7 @@
 #include <vector>
 #include <algorithm>
 #include <memory>
+#include <cstring>
 
 #include <boost/asio.hpp>
 
@@ -162,11 +163,24 @@ namespace voice {
       return;
     }
 
-    // 2) Wait for first packet (client ping) to learn the peer endpoint
+    // 2) Wait for the client ping to learn the peer endpoint. The receive
+    // polls with a timeout so the thread can observe the session shutdown
+    // event and release the UDP port even if no voice-capable client ever
+    // pings (otherwise the port would stay bound for the process lifetime).
     std::array<char, 256> ping_buf;
     udp::endpoint peer;
-    sock.receive_from(boost::asio::buffer(ping_buf), peer, 0, ec);
-    if (ec) return;
+    for (;;) {
+      if (session->shutdown_event->peek()) return;
+
+      DWORD recv_timeout_ms = 500;
+      setsockopt(sock.native_handle(), SOL_SOCKET, SO_RCVTIMEO,
+                 (const char *) &recv_timeout_ms, sizeof(recv_timeout_ms));
+
+      auto n = sock.receive_from(boost::asio::buffer(ping_buf), peer, 0, ec);
+      if (ec == boost::asio::error::would_block || ec.value() == WSAETIMEDOUT) continue;
+      if (ec) return;
+      if (n > 0) break;
+    }
     session->voice.peer = peer;
     BOOST_LOG(info) << "x-ss-voice: peer "sv << peer.address().to_string() << ":"sv << peer.port();
 

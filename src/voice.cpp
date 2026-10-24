@@ -86,7 +86,9 @@ namespace voice {
       wfx.wBitsPerSample = 16;
       wfx.nBlockAlign = 2;
       wfx.nAvgBytesPerSec = SAMPLE_RATE * 2;
-      hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 1000000 /*100ms*/, 0, &wfx, nullptr);
+      hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                               AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                               1000000 /*100ms*/, 0, &wfx, nullptr);
       if (FAILED(hr)) return false;
       hr = client_->GetService(__uuidof(IAudioCaptureClient), (void **) &cap_);
       if (FAILED(hr)) return false;

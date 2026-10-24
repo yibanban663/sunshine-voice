@@ -1,0 +1,30 @@
+[project]
+name = "lizardbyte-common"
+version = "0.0.0"
+description = "Common helpers and tooling for LizardByte projects."
+repository = "https://github.com/LizardByte/lizardbyte-common"
+logo = "https://raw.githubusercontent.com/LizardByte/.github/refs/heads/master/branding/logos/logo.svg"
+
+[build]
+output = "_site"
+work = ".dockle"
+strict = true
+clean = true
+
+[[targets]]
+name = "api"
+title = "lizardbyte-common documentation"
+framework = "doxygen"
+source = "."
+home = true
+
+[targets.doxygen]
+inputs = ["README.md", "src/include", "tests/support/include"]
+extra_stylesheets = [
+  "https://cdn.jsdelivr.net/npm/@lizardbyte/shared-web@2026.930.34219/dist/crowdin-dockle-css.css",
+]
+extra_javascript = [
+  "https://cdn.jsdelivr.net/npm/@lizardbyte/shared-web@2026.930.34219/dist/crowdin.js",
+  "docs/crowdin.js",
+]
+main_page = "README.md"

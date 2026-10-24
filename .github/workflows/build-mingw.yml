@@ -51,7 +51,8 @@ jobs:
             mingw-w64-${TOOLCHAIN}-toolchain \
             mingw-w64-${TOOLCHAIN}-qt6-static \
             mingw-w64-${TOOLCHAIN}-MinHook \
-            mingw-w64-${TOOLCHAIN}-nsis
+            mingw-w64-${TOOLCHAIN}-nsis \
+            mingw-w64-${TOOLCHAIN}-nodejs
 
       - name: Setup python
         id: setup-python
